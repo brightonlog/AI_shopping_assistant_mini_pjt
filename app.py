@@ -19,9 +19,15 @@ import os
 from config import *
 from utils import TokenManager
 
+# 실습과제2 : regex 라이브러리 import 하기
+import re
+
 # 전역 변수
 models = {}
 vector_store = None
+image_vectorstore = None  # CLIP 이미지 벡터 스토어
+image_vectors_cache = []  # CLIP 벡터 캐시 (numpy 배열)
+image_metadata_cache = []  # 상품 메타데이터 캐시
 conversation_chain = None
 search_count = 0
 conversation_history = []
@@ -122,8 +128,61 @@ def load_models():
     models['tokenizer'] = tokenizer
     models['llm'] = model
     
+    # 이미지 벡터 스토어 초기화
+    print("이미지 벡터 스토어 초기화 중...")
+    setup_image_vectorstore()
+    
     print("모든 모델 로딩 완료!")
     return models
+
+def setup_image_vectorstore():
+    """
+    CLIP 이미지 벡터 저장을 위한 ChromaDB 별도 Collection 생성
+    """
+    global image_vectorstore
+    
+    # 이미지 벡터 저장 디렉토리
+    image_persist_dir = "./chroma_db_images"
+    
+    if not os.path.exists(image_persist_dir):
+        os.makedirs(image_persist_dir)
+    
+    # HuggingFace 임베딩 (텍스트용은 기존 것 사용, 이미지는 직접 CLIP 벡터 사용)
+    embeddings = HuggingFaceEmbeddings(
+        model_name=EMBEDDING_MODEL_PATH
+    )
+    
+    image_vectorstore = Chroma(
+        collection_name="product_images",
+        persist_directory=image_persist_dir,
+        embedding_function=embeddings
+    )
+    
+    print("이미지 벡터 스토어 초기화 완료!")
+
+def download_and_preprocess_image(image_url):
+    """
+    상품 이미지 URL에서 이미지 다운로드 및 전처리
+    """
+    try:
+        response = requests.get(image_url, timeout=5)
+        if response.status_code == 200:
+            from io import BytesIO
+            image = Image.open(BytesIO(response.content))
+            # RGB로 변환 (RGBA 등 다른 모드 대응)
+            if image.mode != 'RGB':
+                image = image.convert('RGB')
+            return image
+    except Exception as e:
+        print(f"이미지 다운로드 실패 ({image_url}): {e}")
+    return None
+
+def has_valid_image_url(product):
+    """
+    상품의 유효한 이미지 URL 인지 체크 (placeholder 이미지 제외)
+    """
+    image_url = product.get('image', '')
+    return image_url and 'placeholder' not in image_url and image_url.strip() != ''
 
 def detect_clothing_color(image, bbox):
     """
@@ -256,7 +315,7 @@ def rgb_to_color_name(rgb):
 
 def detect_fashion_objects(image):
     """
-    업로드된 이미지에서 패션 아이템을 탐지합니다.
+    업로드된 이미지에서 패션 아이템을 탐지합니다. (CLIP 통합 버전)
     
     Args:
         image: PIL Image 객체
@@ -310,20 +369,32 @@ def detect_fashion_objects(image):
         if detected_items:
             print(f"총 탐지된 아이템: {detected_items}")
             
-            # 탐지된 아이템으로 초기 상품 검색
-            products = search_products(' '.join(detected_items[:2]))
-            save_products_to_vectorstore(products)
+            # 1. 텍스트 기반 검색 (기존)
+            text_products = search_products(' '.join(detected_items[:2]))
+            save_products_to_vectorstore(text_products)
+            
+            # 2. CLIP 이미지 유사도 검색 (신규)
+            print("CLIP 이미지 유사도 검색 중...")
+            similar_products = search_similar_images(image, k=10)  # 10개로 증가
+            
+            # 3. 검색된 상품들을 CLIP 벡터로 저장
+            save_products_with_clip_vectors(text_products)
+            
+            # 4. 결과 병합 및 중복 제거 (CLIP 검색 결과를 앞에 배치)
+            combined_products = merge_and_deduplicate_products(similar_products, text_products)
+            print(f"병합된 상품 수: {len(combined_products)} (CLIP: {len(similar_products)}, 텍스트: {len(text_products)})")
             
             # HTML 출력 생성
-            html_output = f"<h3>탐지된 아이템</h3><p>{', '.join(detected_items)}</p><hr>"
-            html_output += format_product_html(products)
+            html_output = f"<h3>탐지된 아이템</h3><p>{', '.join(detected_items)}</p>"
+            html_output += f"<p style='color: #666; font-size: 12px;'>텍스트 검색: {len(text_products)}개 | CLIP 검색: {len(similar_products)}개 | 총: {len(combined_products)}개</p><hr>"
+            html_output += format_product_html(combined_products)
             
             # LLM 초기 메시지 생성
             detected_items_str = ', '.join(detected_items)
             
             try:
                 # 간단한 초기 인사 메시지 생성
-                llm_response = f"안녕하세요! 이미지에서 {detected_items_str}을(를) 발견했습니다. 어떤 스타일이나 브랜드를 선호하시나요? 예산도 알려주시면 더 정확한 추천을 도와드릴 수 있어요."
+                llm_response = f"안녕하세요! 이미지에서 {detected_items_str}을(를) 발견했습니다. 텍스트 검색과 이미지 유사도 검색을 통해 {len(combined_products)}개의 상품을 찾았어요. 어떤 스타일이나 브랜드를 선호하시나요? 예산도 알려주시면 더 정확한 추천을 도와드릴 수 있어요."
                 
                 # 대화 히스토리에 추가
                 conversation_history.append({"role": "assistant", "content": llm_response})
@@ -362,6 +433,330 @@ def extract_clip_features(image):
         image_features = models['clip_model'].get_image_features(**inputs)
     
     return image_features.cpu().numpy()
+
+def save_products_with_clip_vectors(products):
+    """
+    네이버 API로 가져온 상품들을 CLIP 벡터로 변환하여 저장
+    """
+    global image_vectorstore, image_vectors_cache, image_metadata_cache
+    
+    if not products:
+        return
+    
+    print(f"{len(products)}개 상품의 이미지 벡터 추출 중...")
+    
+    for idx, product in enumerate(products):
+        if has_valid_image_url(product):
+            try:
+                # 이미지 다운로드
+                image = download_and_preprocess_image(product['image'])
+                if image is None:
+                    continue
+                
+                # CLIP 벡터 추출
+                clip_vector = extract_clip_features(image)
+                clip_vector_flat = clip_vector.flatten()
+                
+                # 메타데이터 준비
+                metadata = {
+                    'title': product.get('title', ''),
+                    'link': product.get('link', ''),
+                    'lprice': product.get('lprice', '0'),
+                    'hprice': product.get('hprice', '0'),
+                    'mall': product.get('mallName', ''),
+                    'image': product.get('image', ''),
+                    'productId': str(product.get('productId', '')),
+                    'brand': product.get('brand', ''),
+                    'maker': product.get('maker', ''),
+                    'category1': product.get('category1', ''),
+                    'category2': product.get('category2', '')
+                }
+                
+                # 중복 체크 - productId와 image 모두 확인
+                product_id = metadata['productId']
+                image_url = metadata['image']
+                
+                is_duplicate = False
+                if product_id:
+                    is_duplicate = any(m.get('productId') == product_id for m in image_metadata_cache)
+                if not is_duplicate and image_url:
+                    is_duplicate = any(m.get('image') == image_url for m in image_metadata_cache)
+                
+                if is_duplicate:
+                    continue
+                
+                # 메모리에 저장
+                image_vectors_cache.append(clip_vector_flat)
+                image_metadata_cache.append(metadata)
+                
+            except Exception as e:
+                print(f"이미지 벡터 추출 실패: {e}")
+                continue
+    
+    print(f"{len(image_vectors_cache)}개의 이미지 벡터 저장 완료!")
+
+def search_similar_images(user_uploaded_image, k=5):
+    """
+    사용자가 업로드한 이미지와 유사한 상품 이미지 검색 (CLIP 벡터 코사인 유사도)
+    """
+    global image_vectors_cache, image_metadata_cache
+    
+    if not image_vectors_cache:
+        print("저장된 이미지 벡터가 없습니다.")
+        return []
+    
+    try:
+        # 사용자 이미지의 CLIP 벡터 추출
+        user_clip_vector = extract_clip_features(user_uploaded_image).flatten()
+        
+        # 모든 저장된 벡터와 코사인 유사도 계산
+        similarities = []
+        for idx, stored_vector in enumerate(image_vectors_cache):
+            # 코사인 유사도 = (A · B) / (||A|| * ||B||)
+            dot_product = np.dot(user_clip_vector, stored_vector)
+            norm_user = np.linalg.norm(user_clip_vector)
+            norm_stored = np.linalg.norm(stored_vector)
+            
+            if norm_user > 0 and norm_stored > 0:
+                similarity = dot_product / (norm_user * norm_stored)
+                similarities.append((idx, similarity))
+        
+        # 유사도 높은 순으로 정렬
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        
+        # 상위 k개 반환
+        similar_products = []
+        for idx, sim_score in similarities[:k]:
+            metadata = image_metadata_cache[idx]
+            print(f"유사도: {sim_score:.4f} - {metadata['title'][:30]}...")
+            similar_products.append({
+                'title': metadata.get('title', ''),
+                'link': metadata.get('link', ''),
+                'lprice': metadata.get('lprice', '0'),
+                'hprice': metadata.get('hprice', '0'),
+                'mallName': metadata.get('mall', ''),
+                'image': metadata.get('image', ''),
+                'productId': metadata.get('productId', ''),
+                'brand': metadata.get('brand', ''),
+                'maker': metadata.get('maker', ''),
+                'category1': metadata.get('category1', ''),
+                'category2': metadata.get('category2', '')
+            })
+        
+        return similar_products
+        
+    except Exception as e:
+        print(f"이미지 검색 오류: {e}")
+        import traceback
+        traceback.print_exc()
+        return []
+
+def merge_and_deduplicate_products(list1, list2):
+    """
+    두 상품 리스트를 통합하고 중복 제거
+    """
+    # productId, image, title 기준으로 중복 제거
+    seen_ids = set()
+    seen_images = set()
+    seen_titles = set()
+    merged = []
+    
+    for product in list1 + list2:
+        pid = product.get('productId', '')
+        image = product.get('image', '')
+        title = product.get('title', '')
+        
+        # 중복 체크: productId, image, title 모두 확인
+        is_duplicate = False
+        if pid and pid in seen_ids:
+            is_duplicate = True
+        if image and image in seen_images:
+            is_duplicate = True
+        if title and title in seen_titles:
+            is_duplicate = True
+        
+        if not is_duplicate:
+            if pid:
+                seen_ids.add(pid)
+            if image:
+                seen_images.add(image)
+            if title:
+                seen_titles.add(title)
+            merged.append(product)
+    
+    return merged
+
+def integrate_clip_search_to_detection(image):
+    """
+    기존 detect_fashion_objects 함수에 CLIP 검색 통합
+    """
+    try:
+        # 1. YOLO 탐지 (기존 로직)
+        detected_items, text_products = detect_fashion_objects_only(image)
+        
+        # 2. CLIP 이미지 유사도 검색
+        similar_products = search_similar_images(image, k=5)
+        
+        # 3. 새로 검색된 상품들을 CLIP 벡터로 저장
+        if text_products:
+            save_products_with_clip_vectors(text_products)
+        
+        # 4. 결과 병합
+        combined_products = merge_and_deduplicate_products(text_products, similar_products)
+        
+        return detected_items, combined_products
+        
+    except Exception as e:
+        print(f"CLIP 통합 검색 오류: {e}")
+        return [], []
+
+def detect_fashion_objects_only(image):
+    """
+    YOLO로 패션 아이템 탐지 및 텍스트 검색만 수행 (CLIP 제외)
+    """
+    # 기존 detect_fashion_objects 로직을 복사하되, 반환값만 수정
+    try:
+        results = models['yolo'](image, task='segment')
+        print(f"YOLO 탐지 결과 수: {len(results)}")
+        
+        img_array = np.array(image)
+        img_with_boxes = img_array.copy()
+        
+        detected_items = []
+        
+        if results and len(results) > 0:
+            result = results[0]
+            if result.boxes is not None and len(result.boxes) > 0:
+                print(f"박스 수: {len(result.boxes)}")
+                
+                for i, box in enumerate(result.boxes):
+                    class_id = int(box.cls.item())
+                    class_name = result.names[class_id]
+                    confidence = box.conf.item()
+                    
+                    if confidence > 0.5:
+                        xyxy = box.xyxy[0].cpu().numpy()
+                        x1, y1, x2, y2 = xyxy
+                        
+                        color_name, color_rgb = detect_clothing_color(image, xyxy)
+                        
+                        cv2.rectangle(img_with_boxes, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                        label = f"{class_name}: {confidence:.2f} ({color_name})"
+                        cv2.putText(img_with_boxes, label, (int(x1), int(y1-10)), 
+                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        
+                        detected_items.append(f"{color_name} {class_name}")
+        
+        # 탐지된 아이템으로 상품 검색
+        products = []
+        if detected_items:
+            products = search_products(' '.join(detected_items[:2]))
+            save_products_to_vectorstore(products)
+        
+        return detected_items, products
+        
+    except Exception as e:
+        print(f"탐지 오류: {e}")
+        return [], []
+
+
+# 실습과제 2 : regex 라이브러리를 사용하여 숫자 추출하기
+# 실습과제
+
+import re
+
+def parse_budget_request(message):
+    """
+    사용자의 메시지에서 예산(금액)과 필터 조건(이하, 이상, 정도 등)을 추출합니다.
+    """
+    # 반환할 기본 데이터 구조 
+    budget_info = {
+        "target_price": None,
+        "condition": None
+    }
+
+    # 1. N 만원 + 키워드로 패턴 정의
+    # (\d+): 숫자 그룹, ([가-힣\s]+): 뒤에 오는 한글 키워드 그룹
+    budget_pattern = r"(\d+)\s*만\s*원\s*([가-힣\s]*)"
+    match = re.search(budget_pattern, message)
+    
+    # 문자열 전체에서 패턴과 일치하는 위치 찾고, 일치하는 경우 match 객체를 반환하고 없으면 None 반환
+    
+    if match:
+        # 만원을 10000으로 변환
+        amount = int(match.group(1))
+        budget_info["target_price"] = amount * 10000
+
+        # 뒤에 붙은 키워드도 추출하기
+        keyword = match.group(2).strip()
+
+        # 키워드에 따라 가격 컨디션(이하, 정도, 이상) 설정
+
+        if any(k in keyword for k in ["이하", "아래", "저렴한", "싼", "낮은"]):
+            budget_info["condition"] = "under"
+        elif "정도" in keyword or "쯤" in keyword:
+            budget_info["condition"] = "around"
+        elif any(k in keyword for k in ["이상", "비싼", "높은", "초과"]):
+            budget_info["condition"] = "over"
+        else:
+            # 키워드가 딱히 없으면 기본적으로 '이하(under)'로 간주
+            budget_info["condition"] = "under"
+
+        # 숫자 없이 "더 저렴한", "더 싼"만 있는 경우 처리 (이전 기록 활용용)
+    elif any(k in message for k in ["더 저렴한", "더 싼", "더 저가"]):
+        budget_info["condition"] = "cheaper"
+
+    return budget_info
+
+# 실습과제2. 상품 리스트 필터링 및 정렬하는 함수 만들기
+def apply_budget_filter(products, budget_info):
+    """
+    검색된 상품 리스트를 사용자의 예산 조건에 맞게 필터링하고 정렬합니다.
+    """
+    condition = budget_info["condition"]
+    target = budget_info["target_price"]
+    filtered_products = []
+
+    # 1. '더 저렴한' 요청일 경우 기준값(target)을 이전 검색 결과의 평균가로 설정
+    if condition == "cheaper" and products:
+        # 모든 상품의 lprice를 숫자로 변환하여 합산
+        prices = [int(p.get('lprice', 0)) for p in products]
+        # 평균가 계산
+        target = sum(prices) / len(prices)
+
+    # 2. 각 상품을 돌면서 조건에 맞는지 확인 (Filtering)
+    for product in products:
+        # 상품 가격을 숫자로 변환 (비교를 위해 필수!)
+        try:
+            price = int(product.get('lprice', 0))
+        except (ValueError, TypeError):
+            continue
+            
+        # 조건별 필터링 로직 
+        if condition == "under" or condition == "cheaper":
+            # 설정한 금액(또는 평균가) 이하인 상품만 추가
+            if price <= target:
+                filtered_products.append(product)
+        
+        elif condition == "over":
+            # 설정한 금액 이상인 상품만 추가
+            if price >= target:
+                filtered_products.append(product)
+        
+        elif condition == "around":
+            # 설정한 금액의 20% 내외 범위 (0.8배 ~ 1.2배)
+            if target * 0.8 <= price <= target * 1.2:
+                filtered_products.append(product)
+        
+        else:
+            # 특별한 조건이 없으면(None 등) 모든 상품을 결과에 포함
+            filtered_products.append(product)
+
+    # 3. 가격이 낮은 순으로 정렬 
+    # lambda를 사용하여 lprice를 숫자로 변환한 뒤 오름차순 정렬
+    final_products = sorted(filtered_products, key=lambda x: int(x.get('lprice', 0)))
+    
+    return final_products
 
 def search_products(query):
     """
@@ -425,6 +820,8 @@ def search_products(query):
                     filtered_items.append(item)
             
             print(filtered_items)
+            # CLIP 벡터도 저장
+            save_products_with_clip_vectors(filtered_items)
             return filtered_items
     except Exception as e:
         print(f"API 호출 오류: {e}")
@@ -525,7 +922,7 @@ def search_from_vectorstore(query):
             products.append({
                 'title': doc.metadata.get('title', ''),
                 'link': doc.metadata.get('link', ''),
-                'lprice': doc.metadata.get('price', '0'),
+                'lprice': doc.metadata.get('lprice') or doc.metadata.get('price', '0'),  # lprice 또는 price
                 'hprice': doc.metadata.get('hprice', '0'),
                 'mallName': doc.metadata.get('mall', ''),
                 'image': doc.metadata.get('image', 'https://placehold.co/150'),
@@ -642,6 +1039,30 @@ def should_search_web(query):
     
     return any(keyword in query for keyword in search_keywords)
 
+def extract_color_keywords(query):
+    """
+    검색어에서 색상 키워드 추출
+    """
+    color_mapping = {
+        '파란': ['blue', 'navy', '네이비', '파란색', '블루'],
+        '빨간': ['red', '레드', '빨강', '빨간색'],
+        '하양': ['white', '화이트', '하얀', '하양색', '원피스'],
+        '검정': ['black', '블랙', '검은', '검정색'],
+        '노란': ['yellow', '원로우', '노랑'],
+        '초록': ['green', '그린'],
+        '보라': ['purple', '퍼플'],
+        '분홍': ['pink', '핑크'],
+        '갈색': ['brown', '브라운'],
+        '회색': ['gray', 'grey', '그레이']
+    }
+    
+    detected_colors = []
+    for ko_color, variations in color_mapping.items():
+        if any(v in query.lower() for v in variations):
+            detected_colors.append(ko_color)
+    
+    return detected_colors
+
 def generate_response_with_context(user_input, conversation_history, search_results=None):
     """
     LLM을 사용하여 대화 컨텍스트를 고려한 응답을 생성합니다.
@@ -701,91 +1122,85 @@ def generate_response_with_context(user_input, conversation_history, search_resu
     
     return response
 
-def chat_response(message, history):
-    """
-    사용자 메시지에 대한 챗봇 응답을 생성합니다.
-    
-    Args:
-        message: 사용자 메시지
-        history: Gradio 대화 히스토리
-        
-    Returns:
-        history: 업데이트된 대화 히스토리
-    """
+# 실습과제 2: 예산 조건에 따른 챗봇 응답 생성 함수
+def chat_response_with_budget(message, history):
+
     global search_count, conversation_history
     
-    # 메시지가 비어있으면 현재 히스토리 반환
+    # 1. 메시지가 비어있으면 현재 히스토리 반환
     if not message or not message.strip():
-        return history
+        return history, ""
     
-    # Gradio 히스토리를 내부 형식으로 변환
+    # 2. 실습과제 2: 사용자 메시지에서 예산 조건 파싱하기
+    budget_info = parse_budget_request(message)
+    
+    # 3. Gradio 히스토리를 내부 형식으로 변환
     if history:
         for h in history:
             if isinstance(h, list) and len(h) == 2:
                 user_msg_content = h[0]
                 assistant_msg_content = h[1]
                 
-                # None이나 빈 메시지 건너뛰기
                 if not user_msg_content or not assistant_msg_content:
                     continue
                     
-                # 문자열로 변환
                 user_msg_content = str(user_msg_content) if user_msg_content else ""
                 assistant_msg_content = str(assistant_msg_content) if assistant_msg_content else ""
                 
-                # 이미 추가된 대화는 스킵
-                user_msg = {"role": "user", "content": user_msg_content}
-                assistant_msg = {"role": "assistant", "content": assistant_msg_content}
-                
-                # 중복 확인 (content만 비교)
                 user_exists = any(msg.get('content') == user_msg_content for msg in conversation_history if msg.get('role') == 'user')
                 assistant_exists = any(msg.get('content') == assistant_msg_content for msg in conversation_history if msg.get('role') == 'assistant')
                 
                 if not user_exists and user_msg_content:
-                    conversation_history.append(user_msg)
+                    conversation_history.append({"role": "user", "content": user_msg_content})
                 if not assistant_exists and assistant_msg_content:
-                    conversation_history.append(assistant_msg)
+                    conversation_history.append({"role": "assistant", "content": assistant_msg_content})
     
-    # 현재 메시지 추가 및 토큰 관리
+    # 4. 현재 메시지 추가 및 토큰 관리
     conversation_history, token_count = token_manager.manage_conversation_history(
         conversation_history,
         {"role": "user", "content": message}
     )
     
-    html_output = ''
-    # 웹 검색 필요 여부 판단
+    # 5. 상품 검색 수행 (웹 검색 또는 벡터 DB)
+    products = []
+    
+    # 색상 키워드 추출
+    color_keywords = extract_color_keywords(message)
+    
     if should_search_web(message) and search_count < MAX_SEARCH_COUNT:
-        # 웹에서 새로운 상품 검색
         print(f'\n웹 검색 : {message}\n')
         products = search_products(message)
         save_products_to_vectorstore(products)
-        search_results = format_product_list(products)
-        html_output = format_product_html(products)
-        
-        # LLM에 대화 컨텍스트와 함께 전달
-        response = generate_response_with_context(
-            message, 
-            conversation_history, 
-            search_results
-        )
-        
-        # 검색 결과 추가
-        if products:
-            response += f"\n\n{search_results}"
     else:
-        # 벡터 DB 에서 새로운 상품 검색
         print(f'\n벡터 DB 검색 : {message}\n')
-        # 벡터 스토어에서 검색
-        docs = vector_store.similarity_search(message, k=VECTOR_SEARCH_K)
-        products = []
+        if color_keywords:
+            print(f"감지된 색상: {', '.join(color_keywords)}")
         
+        # 기본 검색어에 색상 키워드 추가
+        search_query = message
+        if color_keywords:
+            # 색상 키워드를 영어로 변환하여 검색
+            color_terms = []
+            for color in color_keywords:
+                if '파란' in color:
+                    color_terms.extend(['blue', 'navy'])
+                elif '하얀' in color or '하양' in color:
+                    color_terms.extend(['white', 'ivory'])
+                elif '검' in color:
+                    color_terms.extend(['black'])
+                elif '빨' in color:
+                    color_terms.extend(['red'])
+                elif '분홍' in color:
+                    color_terms.extend(['pink'])
+            search_query = f"{message} {' '.join(color_terms)}"
+        
+        docs = vector_store.similarity_search(search_query, k=VECTOR_SEARCH_K*2)  # 더 많이 검색
         for doc in docs:
             if doc.metadata:
-                # 메타데이터에서 상품 정보 복원
                 product = {
                     'title': doc.metadata.get('title', ''),
                     'link': doc.metadata.get('link', ''),
-                    'lprice': doc.metadata.get('price', '0'),
+                    'lprice': doc.metadata.get('lprice') or doc.metadata.get('price', '0'),
                     'hprice': doc.metadata.get('hprice', '0'),
                     'mallName': doc.metadata.get('mall', ''),
                     'image': doc.metadata.get('image', 'https://placehold.co/150'),
@@ -794,34 +1209,65 @@ def chat_response(message, history):
                     'category1': doc.metadata.get('category1', ''),
                     'category2': doc.metadata.get('category2', '')
                 }
-                products.append(product)
+                
+                # 색상 필터링: title에 색상 키워드가 포함된 경우 우선
+                if color_keywords:
+                    title_lower = product['title'].lower()
+                    # 색상 키워드가 title에 있으면 추가
+                    if any(color in title_lower for colors in [['파란', 'blue', 'navy'], ['하얀', 'white', 'ivory'], ['검', 'black'], ['빨', 'red']] for color in colors):
+                        products.append(product)
+                elif len(products) < VECTOR_SEARCH_K:
+                    # 색상 필터 없으면 모든 결과 추가
+                    products.append(product)
         
-        html_output = format_product_html(products)
-        if products:
-            search_results = format_product_list(products)
-            response = generate_response_with_context(
-                message,
-                conversation_history,
-                search_results
-            )
-        else:
-            response = generate_response_with_context(
-                message,
-                conversation_history
-            )
+        # 색상 필터링 후 결과가 적으면 색상 필터 없이 추가
+        if len(products) < 3 and color_keywords:
+            print("색상 필터링 결과가 적어 추가 결과를 포함합니다.")
+            for doc in docs:
+                if doc.metadata and len(products) < VECTOR_SEARCH_K:
+                    product = {
+                        'title': doc.metadata.get('title', ''),
+                        'link': doc.metadata.get('link', ''),
+                        'lprice': doc.metadata.get('lprice') or doc.metadata.get('price', '0'),
+                        'hprice': doc.metadata.get('hprice', '0'),
+                        'mallName': doc.metadata.get('mall', ''),
+                        'image': doc.metadata.get('image', 'https://placehold.co/150'),
+                        'brand': doc.metadata.get('brand', ''),
+                        'maker': doc.metadata.get('maker', ''),
+                        'category1': doc.metadata.get('category1', ''),
+                        'category2': doc.metadata.get('category2', '')
+                    }
+                    # 중복 체크
+                    if not any(p.get('productId') == product.get('productId') for p in products):
+                        products.append(product)
+
+    # 6. 실습과제 2: 예산 조건이 있으면 검색 결과에 필터 및 정렬 적용
+    if budget_info["condition"] and products:
+        products = apply_budget_filter(products, budget_info)
+        print(f"필터링 완료: {len(products)}개의 상품이 조건에 맞습니다.")
+
+    # 7. 필터링된 결과(products)를 사용하여 응답 및 HTML 생성
+    html_output = format_product_html(products)
+    search_results = format_product_list(products) if products else None
     
-    # 응답을 대화 히스토리에 추가
+    # LLM 응답 생성
+    response = generate_response_with_context(
+        message, 
+        conversation_history, 
+        search_results
+    )
+    
+    # 8. 응답을 대화 히스토리에 추가 및 토큰 통계 관리
     conversation_history, _ = token_manager.manage_conversation_history(
         conversation_history,
         {"role": "assistant", "content": response}
     )
     
-    # 토큰 통계 정보 추가
     token_stats = token_manager.get_token_stats(conversation_history)
-    response += f"\n\n(Tip. '최신', '신상', '재고', '실시간', '현재', '오늘'  키워드를 포함해보세요.)"
+    response += f"\n\n(Tip. '최신', '신상', '재고' 키워드를 포함해보세요.)"
     response += f"\n\n[검색: {search_count}/{MAX_SEARCH_COUNT}] [토큰: {token_stats['total']}/{MAX_CONTEXT_TOKENS}] [메시지: {token_stats['messages']}]"
     
-    # Gradio 형식으로 대화 히스토리 업데이트
+    # 9. Gradio 형식으로 최종 대화 히스토리 업데이트 및 반환
     if history is None:
         history = []
     history.append([message, response])
@@ -880,10 +1326,10 @@ def create_interface():
         )
         
         # 메시지 전송 이벤트
-        msg.submit(fn=chat_response, inputs=[msg, chatbot], outputs=[chatbot, detection_info]).then(
+        msg.submit(fn=chat_response_with_budget, inputs=[msg, chatbot], outputs=[chatbot, detection_info]).then(
             fn=lambda: "", outputs=msg
         )
-        submit.click(fn=chat_response, inputs=[msg, chatbot], outputs=[chatbot, detection_info]).then(
+        submit.click(fn=chat_response_with_budget, inputs=[msg, chatbot], outputs=[chatbot, detection_info]).then(
             fn=lambda: "", outputs=msg
         )
         
@@ -898,12 +1344,82 @@ def create_interface():
     
     return demo
 
+def load_initial_products():
+    """
+    fashion_products.json 파일에서 초기 상품 데이터를 벡터 스토어에 로드합니다.
+    카테고리 균형을 맞춰 다양한 상품이 로드되도록 합니다.
+    """
+    import json
+    
+    json_file = 'fashion_products.json'
+    if not os.path.exists(json_file):
+        print(f"{json_file} 파일을 찾을 수 없습니다.")
+        return
+    
+    try:
+        with open(json_file, 'r', encoding='utf-8') as f:
+            products = json.load(f)
+        
+        # 카테고리별 상품 수 제한 (균형 있는 데이터셋 구성)
+        category_counts = {}
+        max_pants = 30  # 바지는 최대 30개
+        max_per_category = 60  # 다른 카테고리는 최대 60개
+        
+        # JSON 데이터를 네이버 API 형식으로 변환
+        formatted_products = []
+        for p in products:
+            category = p.get('category', '')
+            
+            # 카테고리별 개수 체크
+            if '바지' in category or 'pants' in category.lower():
+                if category_counts.get('바지', 0) >= max_pants:
+                    continue
+                category_counts['바지'] = category_counts.get('바지', 0) + 1
+            else:
+                if category_counts.get(category, 0) >= max_per_category:
+                    continue
+                category_counts[category] = category_counts.get(category, 0) + 1
+            
+            formatted_products.append({
+                'title': p.get('title', ''),
+                'link': p.get('link', ''),
+                'lprice': p.get('price', '0'),  # price를 lprice로 변환
+                'hprice': p.get('price', '0'),
+                'mallName': p.get('mall', ''),
+                'image': p.get('image', 'https://placehold.co/150'),
+                'productId': p.get('productId', ''),
+                'brand': p.get('brand', ''),
+                'maker': p.get('brand', ''),
+                'category1': p.get('category', ''),
+                'category2': ''
+            })
+            
+            # 300개까지만 로드
+            if len(formatted_products) >= 300:
+                break
+        
+        print(f"카테고리별 분포: {category_counts}")
+        print(f"{len(formatted_products)}개의 초기 상품 데이터를 벡터 스토어에 로딩 중...")
+        save_products_to_vectorstore(formatted_products)
+        
+        # CLIP 이미지 벡터도 저장 (시간이 걸릴 수 있음)
+        print("초기 상품의 이미지 벡터 추출 중... (시간이 걸릴 수 있습니다)")
+        save_products_with_clip_vectors(formatted_products)
+        
+        print("초기 상품 데이터 로딩 완료!")
+    except Exception as e:
+        print(f"초기 데이터 로딩 오류: {e}")
+
 if __name__ == "__main__":
     print("AI 쇼핑 어시스턴트 시작...")
     print("모델 로딩 중...")
     load_models()
-    print("서버 시작...")
     
+    # 초기 상품 데이터 로드
+    print("초기 상품 데이터 로딩 중...")
+    load_initial_products()
+    
+    print("서버 시작...")
     demo = create_interface()
     demo.launch(
         server_port=GRADIO_SERVER_PORT,
